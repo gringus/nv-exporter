@@ -1,0 +1,31 @@
+[Unit]
+Description=nv-exporter — NVIDIA DGX System Monitor
+Documentation=https://github.com/gringus/nv-exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nv-exporter -p 9101
+Restart=on-failure
+RestartSec=5
+
+User=root
+Group=root
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/proc /sys
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nv-exporter
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,200 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+
+      - name: Static analysis
+        run: cppcheck --enable=all --suppress=missingIncludeSystem nv-exporter.c
+
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Build
+        run: make portable && make demo-load
+
+      - name: Test
+        run: make test
+
+      - name: Upload nv-exporter
+        uses: actions/upload-artifact@v7
+        with:
+          name: nv-exporter-linux-arm64
+          path: nv-exporter
+
+      - name: Upload demo-load
+        uses: actions/upload-artifact@v7
+        with:
+          name: demo-load-linux-arm64
+          path: demo-load
+
+  # Legacy arm64 build (glibc 2.35) for Jetson and older systems
+  build-arm64-legacy:
+    runs-on: ubuntu-24.04-arm
+    container: ubuntu:22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y build-essential git
+
+      - name: Build
+        run: make portable && make demo-load
+
+      - name: Test
+        run: make test
+
+      - name: Upload nv-exporter
+        uses: actions/upload-artifact@v7
+        with:
+          name: nv-exporter-linux-arm64-legacy
+          path: nv-exporter
+
+      - name: Upload demo-load
+        uses: actions/upload-artifact@v7
+        with:
+          name: demo-load-linux-arm64-legacy
+          path: demo-load
+
+  build-amd64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Build
+        run: make portable && make demo-load
+
+      - name: Test
+        run: make test
+
+      - name: Upload nv-exporter
+        uses: actions/upload-artifact@v7
+        with:
+          name: nv-exporter-linux-amd64
+          path: nv-exporter
+
+      - name: Upload demo-load
+        uses: actions/upload-artifact@v7
+        with:
+          name: demo-load-linux-amd64
+          path: demo-load
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-arm64, build-arm64-legacy, build-amd64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Checkout for deb package
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Rename binaries
+        run: |
+          cp $RUNNER_TEMP/artifacts/nv-exporter-linux-arm64/nv-exporter nv-exporter-linux-arm64
+          cp $RUNNER_TEMP/artifacts/demo-load-linux-arm64/demo-load demo-load-linux-arm64
+          cp $RUNNER_TEMP/artifacts/nv-exporter-linux-arm64-legacy/nv-exporter nv-exporter-linux-arm64-legacy
+          cp $RUNNER_TEMP/artifacts/demo-load-linux-arm64-legacy/demo-load demo-load-linux-arm64-legacy
+          cp $RUNNER_TEMP/artifacts/nv-exporter-linux-amd64/nv-exporter nv-exporter-linux-amd64
+          cp $RUNNER_TEMP/artifacts/demo-load-linux-amd64/demo-load demo-load-linux-amd64
+          chmod +x nv-exporter-linux-* demo-load-linux-*
+
+      - name: Build deb package (arm64)
+        run: |
+          sudo apt-get install -y fakeroot > /dev/null 2>&1 || true
+
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          mkdir -p deb-pkg/usr/bin deb-pkg/usr/lib/systemd/system deb-pkg/DEBIAN
+          cp nv-exporter-linux-arm64 deb-pkg/usr/bin/nv-exporter
+          cp deploy/nv-exporter.service deb-pkg/usr/lib/systemd/system/
+
+          sed "s#__VERSION__#$VERSION#g;
+               s#__MAINTAINER__#$GITHUB_ACTOR#g;
+               s#__PKG_ARCH__#arm64#g" \
+            debian/control > deb-pkg/DEBIAN/control
+
+          for script in postinst prerm postrm; do
+            cp "debian/$script" deb-pkg/DEBIAN/
+            chmod +x "deb-pkg/DEBIAN/$script"
+          done
+
+          fakeroot dpkg-deb --build deb-pkg "nv-exporter_${VERSION}_arm64.deb"
+
+      - name: Build deb package (amd64)
+        run: |
+          sudo apt-get install -y fakeroot > /dev/null 2>&1 || true
+
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          mkdir -p deb-pkg/usr/bin deb-pkg/usr/lib/systemd/system deb-pkg/DEBIAN
+          cp nv-exporter-linux-amd64 deb-pkg/usr/bin/nv-exporter
+          cp deploy/nv-exporter.service deb-pkg/usr/lib/systemd/system/
+
+          sed "s/__VERSION__/$VERSION/g;
+               s/__MAINTAINER__/$GITHUB_ACTOR/g;
+               s/__PKG_ARCH__/amd64/g" \
+            debian/control > deb-pkg/DEBIAN/control
+
+          for script in postinst prerm postrm; do
+            cp "debian/$script" deb-pkg/DEBIAN/
+            chmod +x "deb-pkg/DEBIAN/$script"
+          done
+
+          fakeroot dpkg-deb --build deb-pkg "nv-exporter_${VERSION}_amd64.deb"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          # append_body intentionally NOT set: re-pushing a tag would
+          # otherwise append this section to the still-existing release body.
+          body: |
+
+            ## Which binary should I download?
+
+            | File | Use on |
+            |------|--------|
+            | `nv-exporter-linux-arm64` | Modern aarch64 Linux (Ubuntu 24.04+, glibc 2.39+). **DGX Spark.** |
+            | `nv-exporter-linux-arm64-legacy` | Older aarch64 Linux (glibc 2.35+). **Jetson Orin / JetPack 5/6.** Also works on newer systems. |
+            | `nv-exporter-linux-amd64` | x86_64 Linux with an NVIDIA GPU. |
+            | `demo-load-linux-*` | Companion synthetic load generator for testing. Same platform rules as nv-exporter. |
+            | `nv-exporter_*_amd64.deb` | Debian/Ubuntu package for x86_64. |
+            | `nv-exporter_*_arm64.deb` | Debian/Ubuntu package for aarch64. Installs systemd service automatically. |
+
+            If in doubt on arm64, pick `-legacy` — it works almost everywhere.
+          files: |
+            nv-exporter-linux-arm64
+            nv-exporter-linux-amd64
+            nv-exporter-linux-arm64-legacy
+            demo-load-linux-arm64
+            demo-load-linux-amd64
+            demo-load-linux-arm64-legacy
+            nv-exporter_*_amd64.deb
+            nv-exporter_*_arm64.deb

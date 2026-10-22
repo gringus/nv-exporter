@@ -1,0 +1,7 @@
+nv-exporter
+nv-exporter-dbg
+*.o
+demo-load
+tests/test_meminfo
+tests/test_thermal
+nv-monitor

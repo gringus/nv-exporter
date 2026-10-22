@@ -1,0 +1,2 @@
+#!/bin/sh
+systemctl --no-reload disable --now nv-exporter 2>/dev/null || true

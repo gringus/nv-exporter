@@ -1,0 +1,12 @@
+Package: nv-exporter
+Version: __VERSION__
+Section: utils
+Priority: optional
+Architecture: __PKG_ARCH__
+Depends: libc6 (>= 2.32)
+Maintainer: __MAINTAINER__
+Description: NVIDIA DGX Prometheus exporter
+ nv-exporter is a single-file Prometheus exporter for the NVIDIA
+ DGX Spark (Grace ARM CPU + GB10 Blackwell GPU). It exposes CPU,
+ memory, GPU, NIC, and RDMA metrics over HTTP for Prometheus
+ scraping.
