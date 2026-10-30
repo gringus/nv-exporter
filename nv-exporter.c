@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <stddef.h>
 #include <dlfcn.h>
 #include <dirent.h>
 #include <signal.h>
@@ -174,8 +175,7 @@ static volatile sig_atomic_t g_quit = 0;
 
 /* Command-line options */
 static int   prom_port = 0;  /* Prometheus metrics port (0 = not set) */
-static const char *prom_token = NULL; /* Bearer token for /metrics auth */
-static char  prom_expected_hdr[512] = ""; /* "Authorization: Bearer <token>", built at startup */
+static char  prom_expected_hdr[512] = ""; /* "Authorization: Bearer <token>", built at startup; empty = no auth */
 
 /* ── Signal handler ─────────────────────────────────────────────────── */
 
@@ -384,7 +384,6 @@ typedef struct {
     /* Raw values from /proc/meminfo */
     unsigned long long total_kb;
     unsigned long long free_kb;
-    unsigned long long avail_kb;
     unsigned long long buffers_kb;
     unsigned long long cached_kb;
     unsigned long long swap_total_kb;
@@ -415,7 +414,6 @@ static void read_meminfo(MemInfo *m) {
     while (fgets(line, sizeof(line), f)) {
         if (sscanf(line, "MemTotal: %llu kB", &m->total_kb) == 1) continue;
         if (sscanf(line, "MemFree: %llu kB", &m->free_kb) == 1) continue;
-        if (sscanf(line, "MemAvailable: %llu kB", &m->avail_kb) == 1) continue;
         if (sscanf(line, "Buffers: %llu kB", &m->buffers_kb) == 1) continue;
         if (sscanf(line, "Cached: %llu kB", &m->cached_kb) == 1) continue;
         if (sscanf(line, "SwapTotal: %llu kB", &m->swap_total_kb) == 1) continue;
@@ -426,12 +424,11 @@ static void read_meminfo(MemInfo *m) {
     }
     fclose(f);
 
-    /* DGX Spark: when HugePages are active, MemAvailable is inaccurate.
-     * Use HugePages_Free * Hugepagesize instead, and report swap as 0
-     * since hugetlbfs pages are not swappable.
+    /* DGX Spark: when HugePages are active, MemAvailable is inaccurate — the
+     * exporter never uses it (app_kb comes from free + buffers + cached), but
+     * hugetlbfs pages are not swappable, so report swap as 0.
      * See: docs.nvidia.com/dgx/dgx-spark/known-issues.html */
     if (huge_total > 0 && huge_free >= 0 && huge_size > 0) {
-        m->avail_kb = (unsigned long long)(huge_free * huge_size);
         m->swap_free_kb = m->swap_total_kb; /* effective 0 swap used */
     }
 
@@ -454,8 +451,9 @@ static void read_cpu_freqs(void) {
 
 static int tegra_gpu_available = 0;
 static char tegra_gpu_load_path[256] = "";
+static int  tegra_gpu_zone_idx = -1; /* thermal zone index for the GPU, -1 = none */
 
-/* Thermal zone type names that mean "GPU" on Tegra (matched per scrape) */
+/* Thermal zone type names that mean "GPU" on Tegra (matched once at startup) */
 static const char *const tegra_gpu_zone_names[] = { "GPU-therm", "gpu-thermal", NULL };
 
 static void detect_tegra_gpu(void) {
@@ -849,9 +847,9 @@ static pthread_t prom_thread;
 #define PROM_BUF_SIZE (1 << 18) /* 256 KB fixed budget, allocated once at server start */
 
 typedef struct {
-    char     name[96];
+    char     name[96];    /* copied from gpu_static each scrape */
     char     uuid[96];
-    char     vbios[80];   /* static, but re-read per scrape like name/uuid */
+    char     vbios[80];
     unsigned int util_gpu, util_mem;
     unsigned int temp;
     unsigned int power_mw;
@@ -919,27 +917,57 @@ static const char *const viol_reasons[6] = {
 
 static char driver_ver[80] = ""; /* set once at startup when NVML is present */
 
-static int      prom_buf_size = 0;
+/* Static per-GPU data: NVML handle + identifying labels. Handles stay valid
+ * until nvmlShutdown(), and name/uuid/vbios never change — fetched once at
+ * startup, not re-queried per scrape. */
+typedef struct {
+    nvmlDevice_t dev;
+    char name[96];
+    char uuid[96];
+    char vbios[80];
+} GpuStatic;
+static GpuStatic *gpu_static = NULL;
+
 static char    *prom_body = NULL;
 static PromGpu *prom_gpus = NULL;
 
-/* Read all thermal zones. Returns highest valid zone index + 1 (0 = none);
- * caller skips entries with empty type. temps[] in degrees Celsius. */
-static int read_thermal_zones(double temps[], char types[][64]) {
-    int n = 0;
+/* Thermal-zone types never change at runtime: scan them once at startup
+ * (called from main, after detect_tegra_gpu) and per scrape only read the
+ * temp files of zones that exist. tz_max = highest zone index with a type,
+ * +1; 0 = no zones. */
+static char tz_types[MAX_THERMAL_ZONES][64];
+static int  tz_max = 0;
+
+static void detect_thermal_zones(void) {
     for (int i = 0; i < MAX_THERMAL_ZONES; i++) {
         char path[128];
         snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/type", i);
-        read_sysfs_str(path, types[i], 64);
-        if (!types[i][0]) continue;
-        int millideg;
-        snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/temp", i);
-        if (read_sysfs_int(path, &millideg)) {
-            temps[i] = millideg / 1000.0;
-            n = i + 1;
-        }
+        read_sysfs_str(path, tz_types[i], 64);
+        if (!tz_types[i][0]) continue;
+        tz_max = i + 1;
     }
-    return n;
+    /* Tegra: resolve which zone is the GPU once instead of re-matching
+     * names per scrape */
+    if (tegra_gpu_available)
+        for (int z = 0; z < tz_max; z++)
+            for (int k = 0; tegra_gpu_zone_names[k]; k++)
+                if (strcasecmp(tz_types[z], tegra_gpu_zone_names[k]) == 0) {
+                    tegra_gpu_zone_idx = z;
+                    return;
+                }
+}
+
+/* Per-scrape temp read for zones found at startup. Unreadable temps leave
+ * the entry at 0 — emitted like a real 0 reading. */
+static void read_thermal_temps(double temps[]) {
+    for (int i = 0; i < tz_max; i++) {
+        char path[128];
+        int millideg;
+        if (!tz_types[i][0]) continue;
+        snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/temp", i);
+        if (read_sysfs_int(path, &millideg))
+            temps[i] = millideg / 1000.0;
+    }
 }
 
 /* Format all metrics into buf. Returns bytes written. */
@@ -1008,15 +1036,14 @@ static int format_metrics(char *buf, int buflen) {
 
     /* Per-thermal-zone temperatures (zone index + kernel zone type) */
     double tz_temp[MAX_THERMAL_ZONES] = {0};
-    char tz_type[MAX_THERMAL_ZONES][64];
-    int tz_max = read_thermal_zones(tz_temp, tz_type);
+    read_thermal_temps(tz_temp);
     if (tz_max > 0) {
         PM("# HELP nv_thermal_zone_temperature_celsius Thermal zone temperature\n"
            "# TYPE nv_thermal_zone_temperature_celsius gauge\n");
         for (int i = 0; i < tz_max; i++)
-            if (tz_type[i][0])
+            if (tz_types[i][0])
                 PM("nv_thermal_zone_temperature_celsius{zone=\"%d\",type=\"%s\"} %.1f\n",
-                   i, tz_type[i], tz_temp[i]);
+                   i, tz_types[i], tz_temp[i]);
     }
 
     /* CPU frequency */
@@ -1054,49 +1081,26 @@ static int format_metrics(char *buf, int buflen) {
     NetDev net_devs[MAX_NET_DEVS];
     int n_net = read_net_devices(net_devs, MAX_NET_DEVS);
     if (n_net > 0) {
-        PM("# HELP nv_network_receive_bytes_total Total bytes received per network interface\n"
-           "# TYPE nv_network_receive_bytes_total counter\n");
-        for (int i = 0; i < n_net; i++)
-            PM("nv_network_receive_bytes_total{device=\"%s\"} %llu\n",
-               net_devs[i].name, net_devs[i].rx_bytes);
-        PM("# HELP nv_network_transmit_bytes_total Total bytes transmitted per network interface\n"
-           "# TYPE nv_network_transmit_bytes_total counter\n");
-        for (int i = 0; i < n_net; i++)
-            PM("nv_network_transmit_bytes_total{device=\"%s\"} %llu\n",
-               net_devs[i].name, net_devs[i].tx_bytes);
-
-        PM("# HELP nv_network_receive_packets_total Total packets received per network interface\n"
-           "# TYPE nv_network_receive_packets_total counter\n");
-        for (int i = 0; i < n_net; i++)
-            PM("nv_network_receive_packets_total{device=\"%s\"} %llu\n",
-               net_devs[i].name, net_devs[i].rx_packets);
-        PM("# HELP nv_network_transmit_packets_total Total packets transmitted per network interface\n"
-           "# TYPE nv_network_transmit_packets_total counter\n");
-        for (int i = 0; i < n_net; i++)
-            PM("nv_network_transmit_packets_total{device=\"%s\"} %llu\n",
-               net_devs[i].name, net_devs[i].tx_packets);
-
-        PM("# HELP nv_network_receive_errors_total Receive errors per network interface\n"
-           "# TYPE nv_network_receive_errors_total counter\n");
-        for (int i = 0; i < n_net; i++)
-            PM("nv_network_receive_errors_total{device=\"%s\"} %llu\n",
-               net_devs[i].name, net_devs[i].rx_errs);
-        PM("# HELP nv_network_transmit_errors_total Transmit errors per network interface\n"
-           "# TYPE nv_network_transmit_errors_total counter\n");
-        for (int i = 0; i < n_net; i++)
-            PM("nv_network_transmit_errors_total{device=\"%s\"} %llu\n",
-               net_devs[i].name, net_devs[i].tx_errs);
-
-        PM("# HELP nv_network_receive_dropped_total Packets dropped on receive per network interface\n"
-           "# TYPE nv_network_receive_dropped_total counter\n");
-        for (int i = 0; i < n_net; i++)
-            PM("nv_network_receive_dropped_total{device=\"%s\"} %llu\n",
-               net_devs[i].name, net_devs[i].rx_drop);
-        PM("# HELP nv_network_transmit_dropped_total Packets dropped on transmit per network interface\n"
-           "# TYPE nv_network_transmit_dropped_total counter\n");
-        for (int i = 0; i < n_net; i++)
-            PM("nv_network_transmit_dropped_total{device=\"%s\"} %llu\n",
-               net_devs[i].name, net_devs[i].tx_drop);
+        static const struct {
+            const char *name, *help;
+            size_t off; /* offsetof(NetDev, counter) */
+        } net_metrics[] = {
+            { "nv_network_receive_bytes_total",    "Total bytes received per network interface",    offsetof(NetDev, rx_bytes) },
+            { "nv_network_transmit_bytes_total",   "Total bytes transmitted per network interface", offsetof(NetDev, tx_bytes) },
+            { "nv_network_receive_packets_total",  "Total packets received per network interface",  offsetof(NetDev, rx_packets) },
+            { "nv_network_transmit_packets_total", "Total packets transmitted per network interface", offsetof(NetDev, tx_packets) },
+            { "nv_network_receive_errors_total",   "Receive errors per network interface",          offsetof(NetDev, rx_errs) },
+            { "nv_network_transmit_errors_total",  "Transmit errors per network interface",         offsetof(NetDev, tx_errs) },
+            { "nv_network_receive_dropped_total",  "Packets dropped on receive per network interface", offsetof(NetDev, rx_drop) },
+            { "nv_network_transmit_dropped_total", "Packets dropped on transmit per network interface", offsetof(NetDev, tx_drop) },
+        };
+        for (size_t m = 0; m < sizeof(net_metrics) / sizeof(net_metrics[0]); m++) {
+            PM("# HELP %s %s\n# TYPE %s counter\n",
+               net_metrics[m].name, net_metrics[m].help, net_metrics[m].name);
+            for (int i = 0; i < n_net; i++)
+                PM("%s{device=\"%s\"} %llu\n", net_metrics[m].name, net_devs[i].name,
+                   *(unsigned long long *)((char *)&net_devs[i] + net_metrics[m].off));
+        }
     }
 
     int nic_temp = read_nic_asic_temp();
@@ -1168,27 +1172,21 @@ static int format_metrics(char *buf, int buflen) {
     int n_gpus = 0;
 
     if (nvml_ok) {
-        for (unsigned int d = 0; gpus && d < gpu_count; d++) {
+        for (unsigned int d = 0; gpus && gpu_static && d < gpu_count; d++) {
             PromGpu *g = &gpus[n_gpus];
+            if (!gpu_static[d].dev) continue; /* handle fetch failed at startup */
             memset(g, 0, sizeof(*g));
-            nvmlDevice_t dev;
-            if (pNvmlDeviceGetHandleByIndex(d, &dev) != NVML_SUCCESS) continue;
-            pNvmlDeviceGetName(dev, g->name, sizeof(g->name));
-            if (pNvmlDeviceGetUUID)
-                pNvmlDeviceGetUUID(dev, g->uuid, sizeof(g->uuid));
-            if (pNvmlDeviceGetVbiosVersion)
-                pNvmlDeviceGetVbiosVersion(dev, g->vbios, sizeof(g->vbios));
+            memcpy(g->name, gpu_static[d].name, sizeof(g->name));
+            memcpy(g->uuid, gpu_static[d].uuid, sizeof(g->uuid));
+            memcpy(g->vbios, gpu_static[d].vbios, sizeof(g->vbios));
+            nvmlDevice_t dev = gpu_static[d].dev;
 
             if (tegra_gpu_available) {
                 /* Tegra sysfs overrides NVML, which returns zeros there */
                 int tutil = read_tegra_gpu_util();
                 if (tutil >= 0) g->util_gpu = (unsigned int)tutil;
-                for (int z = 0; z < tz_max; z++)
-                    for (int k = 0; tegra_gpu_zone_names[k]; k++)
-                        if (strcasecmp(tz_type[z], tegra_gpu_zone_names[k]) == 0) {
-                            g->temp = (unsigned int)tz_temp[z];
-                            break;
-                        }
+                if (tegra_gpu_zone_idx >= 0)
+                    g->temp = (unsigned int)tz_temp[tegra_gpu_zone_idx];
             } else {
                 if (pNvmlDeviceGetUtilizationRates) {
                     nvmlUtilization_t util = {0};
@@ -1342,15 +1340,13 @@ static int format_metrics(char *buf, int buflen) {
         for (int d = 0; d < n_gpus; d++)
             PM("nv_gpu_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].util_gpu);
 
-        /* Meaningless on unified-memory parts (always 0) — omit like gpu_memory_*,
-         * which is detected via GetMemoryInfo failing with NOT_SUPPORTED */
-        if (gpus[0].has_mem) {
-            PM("# HELP nv_gpu_memory_utilization_percent GPU memory controller utilization\n"
-               "# TYPE nv_gpu_memory_utilization_percent gauge\n");
-            for (int d = 0; d < n_gpus; d++)
-                if (gpus[d].has_mem)
-                    PM("nv_gpu_memory_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].util_mem);
-        }
+        /* Meaningless on unified-memory parts (always 0) — the per-GPU has_mem
+         * guard (GetMemoryInfo fails with NOT_SUPPORTED there) omits the series */
+        PM("# HELP nv_gpu_memory_utilization_percent GPU memory controller utilization\n"
+           "# TYPE nv_gpu_memory_utilization_percent gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_mem)
+                PM("nv_gpu_memory_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].util_mem);
 
         PM("# HELP nv_gpu_temperature_celsius GPU temperature\n"
            "# TYPE nv_gpu_temperature_celsius gauge\n");
@@ -1369,30 +1365,28 @@ static int format_metrics(char *buf, int buflen) {
             if (gpus[d].has_power_instant)
                 PM("nv_gpu_power_instant_watts{gpu=\"%d\"} %.1f\n", d, gpus[d].power_instant_mw / 1000.0);
 
-        if (gpus[0].has_c2c) {
-            PM("# HELP nv_gpu_c2c_link_count NVLink-C2C links between CPU and GPU\n"
-               "# TYPE nv_gpu_c2c_link_count gauge\n");
-            for (int d = 0; d < n_gpus; d++)
-                if (gpus[d].has_c2c)
-                    PM("nv_gpu_c2c_link_count{gpu=\"%d\"} %u\n", d, gpus[d].c2c_count);
-            PM("# HELP nv_gpu_c2c_link_status NVLink-C2C link status (0=inactive 1=active)\n"
-               "# TYPE nv_gpu_c2c_link_status gauge\n");
-            for (int d = 0; d < n_gpus; d++)
-                if (gpus[d].has_c2c)
-                    PM("nv_gpu_c2c_link_status{gpu=\"%d\"} %u\n", d, gpus[d].c2c_status);
-            PM("# HELP nv_gpu_c2c_link_max_bandwidth_mbytes_per_sec NVLink-C2C max bandwidth per active link (MB/s)\n"
-               "# TYPE nv_gpu_c2c_link_max_bandwidth_mbytes_per_sec gauge\n");
-            for (int d = 0; d < n_gpus; d++)
-                if (gpus[d].has_c2c)
-                    PM("nv_gpu_c2c_link_max_bandwidth_mbytes_per_sec{gpu=\"%d\"} %u\n", d, gpus[d].c2c_maxbw_mbs);
-            PM("# HELP nv_gpu_c2c_errors_total NVLink-C2C link errors per link (since driver load; type=crc|replay|b2b_replay)\n"
-               "# TYPE nv_gpu_c2c_errors_total counter\n");
-            for (int d = 0; d < n_gpus; d++)
-                for (int l = 0; l < gpus[d].c2c_err_n; l++)
-                    for (int t = 0; t < 3; t++)
-                        PM("nv_gpu_c2c_errors_total{gpu=\"%d\",link=\"%d\",type=\"%s\"} %u\n",
-                           d, l, c2c_err_types[t], gpus[d].c2c_err[l][t]);
-        }
+        PM("# HELP nv_gpu_c2c_link_count NVLink-C2C links between CPU and GPU\n"
+           "# TYPE nv_gpu_c2c_link_count gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_c2c)
+                PM("nv_gpu_c2c_link_count{gpu=\"%d\"} %u\n", d, gpus[d].c2c_count);
+        PM("# HELP nv_gpu_c2c_link_status NVLink-C2C link status (0=inactive 1=active)\n"
+           "# TYPE nv_gpu_c2c_link_status gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_c2c)
+                PM("nv_gpu_c2c_link_status{gpu=\"%d\"} %u\n", d, gpus[d].c2c_status);
+        PM("# HELP nv_gpu_c2c_link_max_bandwidth_mbytes_per_sec NVLink-C2C max bandwidth per active link (MB/s)\n"
+           "# TYPE nv_gpu_c2c_link_max_bandwidth_mbytes_per_sec gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_c2c)
+                PM("nv_gpu_c2c_link_max_bandwidth_mbytes_per_sec{gpu=\"%d\"} %u\n", d, gpus[d].c2c_maxbw_mbs);
+        PM("# HELP nv_gpu_c2c_errors_total NVLink-C2C link errors per link (since driver load; type=crc|replay|b2b_replay)\n"
+           "# TYPE nv_gpu_c2c_errors_total counter\n");
+        for (int d = 0; d < n_gpus; d++)
+            for (int l = 0; l < gpus[d].c2c_err_n; l++)
+                for (int t = 0; t < 3; t++)
+                    PM("nv_gpu_c2c_errors_total{gpu=\"%d\",link=\"%d\",type=\"%s\"} %u\n",
+                       d, l, c2c_err_types[t], gpus[d].c2c_err[l][t]);
 
         PM("# HELP nv_gpu_clock_max_mhz GPU clock speed ceiling\n"
            "# TYPE nv_gpu_clock_max_mhz gauge\n");
@@ -1455,51 +1449,41 @@ static int format_metrics(char *buf, int buflen) {
             if (gpus[d].has_dec)
                 PM("nv_gpu_decoder_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].dec);
 
-        if (gpus[0].has_pstate) {
-            PM("# HELP nv_gpu_performance_state GPU performance state (P0=max, higher is more idle)\n"
-               "# TYPE nv_gpu_performance_state gauge\n");
-            for (int d = 0; d < n_gpus; d++)
-                if (gpus[d].has_pstate)
-                    PM("nv_gpu_performance_state{gpu=\"%d\"} %u\n", d, gpus[d].pstate);
-        }
+        PM("# HELP nv_gpu_performance_state GPU performance state (P0=max, higher is more idle)\n"
+           "# TYPE nv_gpu_performance_state gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_pstate)
+                PM("nv_gpu_performance_state{gpu=\"%d\"} %u\n", d, gpus[d].pstate);
 
-        if (gpus[0].has_throttle) {
-            /* Raw NVML clocks-event-reasons bitmask (same field DCGM exports) */
-            PM("# HELP nv_gpu_clocks_event_reasons Active clock throttle reasons (bitmask)\n"
-               "# TYPE nv_gpu_clocks_event_reasons gauge\n");
-            for (int d = 0; d < n_gpus; d++)
-                if (gpus[d].has_throttle)
-                    PM("nv_gpu_clocks_event_reasons{gpu=\"%d\"} %llu\n", d, gpus[d].throttle);
-        }
+        /* Raw NVML clocks-event-reasons bitmask (same field DCGM exports) */
+        PM("# HELP nv_gpu_clocks_event_reasons Active clock throttle reasons (bitmask)\n"
+           "# TYPE nv_gpu_clocks_event_reasons gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_throttle)
+                PM("nv_gpu_clocks_event_reasons{gpu=\"%d\"} %llu\n", d, gpus[d].throttle);
 
         /* Cumulative time clocks were held below application clocks per cause.
          * Unlike the event-reasons bitmask, rate() of this never misses a
          * throttle spike between scrapes. */
-        if (gpus[0].has_viol[0]) {
-            PM("# HELP nv_gpu_throttle_duration_seconds_total Cumulative time GPU clocks were limited, per cause\n"
-               "# TYPE nv_gpu_throttle_duration_seconds_total counter\n");
-            for (int d = 0; d < n_gpus; d++)
-                for (int v = 0; v < 6; v++)
-                    if (gpus[d].has_viol[v])
-                        PM("nv_gpu_throttle_duration_seconds_total{gpu=\"%d\",reason=\"%s\"} %.6f\n",
-                           d, viol_reasons[v], gpus[d].viol_ns[v] / 1e9);
-        }
+        PM("# HELP nv_gpu_throttle_duration_seconds_total Cumulative time GPU clocks were limited, per cause\n"
+           "# TYPE nv_gpu_throttle_duration_seconds_total counter\n");
+        for (int d = 0; d < n_gpus; d++)
+            for (int v = 0; v < 6; v++)
+                if (gpus[d].has_viol[v])
+                    PM("nv_gpu_throttle_duration_seconds_total{gpu=\"%d\",reason=\"%s\"} %.6f\n",
+                       d, viol_reasons[v], gpus[d].viol_ns[v] / 1e9);
 
-        if (gpus[0].has_energy) {
-            PM("# HELP nv_gpu_energy_millijoules_total Cumulative GPU energy consumed\n"
-               "# TYPE nv_gpu_energy_millijoules_total counter\n");
-            for (int d = 0; d < n_gpus; d++)
-                if (gpus[d].has_energy)
-                    PM("nv_gpu_energy_millijoules_total{gpu=\"%d\"} %llu\n", d, gpus[d].energy_mj);
-        }
+        PM("# HELP nv_gpu_energy_millijoules_total Cumulative GPU energy consumed\n"
+           "# TYPE nv_gpu_energy_millijoules_total counter\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_energy)
+                PM("nv_gpu_energy_millijoules_total{gpu=\"%d\"} %llu\n", d, gpus[d].energy_mj);
 
-        if (gpus[0].has_replay) {
-            PM("# HELP nv_gpu_pcie_replay_total PCIe TLP replay counter (link health)\n"
-               "# TYPE nv_gpu_pcie_replay_total counter\n");
-            for (int d = 0; d < n_gpus; d++)
-                if (gpus[d].has_replay)
-                    PM("nv_gpu_pcie_replay_total{gpu=\"%d\"} %u\n", d, gpus[d].replay);
-        }
+        PM("# HELP nv_gpu_pcie_replay_total PCIe TLP replay counter (link health)\n"
+           "# TYPE nv_gpu_pcie_replay_total counter\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_replay)
+                PM("nv_gpu_pcie_replay_total{gpu=\"%d\"} %u\n", d, gpus[d].replay);
     }
 
     /* RDMA / InfiniBand */
@@ -1512,35 +1496,24 @@ static int format_metrics(char *buf, int buflen) {
                rdma_ports[i].device, rdma_ports[i].port,
                rdma_ports[i].state, rdma_ports[i].rate);
 
-        PM("# HELP nv_rdma_xmit_bytes_total Total bytes transmitted\n"
-           "# TYPE nv_rdma_xmit_bytes_total counter\n");
-        for (int i = 0; i < rdma_count; i++)
-            PM("nv_rdma_xmit_bytes_total{device=\"%s\",port=\"%d\"} %llu\n",
-               rdma_ports[i].device, rdma_ports[i].port, rdma_ports[i].xmit_bytes);
-
-        PM("# HELP nv_rdma_recv_bytes_total Total bytes received\n"
-           "# TYPE nv_rdma_recv_bytes_total counter\n");
-        for (int i = 0; i < rdma_count; i++)
-            PM("nv_rdma_recv_bytes_total{device=\"%s\",port=\"%d\"} %llu\n",
-               rdma_ports[i].device, rdma_ports[i].port, rdma_ports[i].recv_bytes);
-
-        PM("# HELP nv_rdma_xmit_packets_total Total packets transmitted\n"
-           "# TYPE nv_rdma_xmit_packets_total counter\n");
-        for (int i = 0; i < rdma_count; i++)
-            PM("nv_rdma_xmit_packets_total{device=\"%s\",port=\"%d\"} %llu\n",
-               rdma_ports[i].device, rdma_ports[i].port, rdma_ports[i].xmit_pkts);
-
-        PM("# HELP nv_rdma_recv_packets_total Total packets received\n"
-           "# TYPE nv_rdma_recv_packets_total counter\n");
-        for (int i = 0; i < rdma_count; i++)
-            PM("nv_rdma_recv_packets_total{device=\"%s\",port=\"%d\"} %llu\n",
-               rdma_ports[i].device, rdma_ports[i].port, rdma_ports[i].recv_pkts);
-
-        PM("# HELP nv_rdma_errors_total Total RDMA errors\n"
-           "# TYPE nv_rdma_errors_total counter\n");
-        for (int i = 0; i < rdma_count; i++)
-            PM("nv_rdma_errors_total{device=\"%s\",port=\"%d\"} %llu\n",
-               rdma_ports[i].device, rdma_ports[i].port, rdma_ports[i].errors);
+        static const struct {
+            const char *name, *help;
+            size_t off; /* offsetof(RdmaPort, counter) */
+        } rdma_metrics[] = {
+            { "nv_rdma_xmit_bytes_total",   "Total bytes transmitted",    offsetof(RdmaPort, xmit_bytes) },
+            { "nv_rdma_recv_bytes_total",   "Total bytes received",       offsetof(RdmaPort, recv_bytes) },
+            { "nv_rdma_xmit_packets_total", "Total packets transmitted",  offsetof(RdmaPort, xmit_pkts) },
+            { "nv_rdma_recv_packets_total", "Total packets received",     offsetof(RdmaPort, recv_pkts) },
+            { "nv_rdma_errors_total",       "Total RDMA errors",          offsetof(RdmaPort, errors) },
+        };
+        for (size_t m = 0; m < sizeof(rdma_metrics) / sizeof(rdma_metrics[0]); m++) {
+            PM("# HELP %s %s\n# TYPE %s counter\n",
+               rdma_metrics[m].name, rdma_metrics[m].help, rdma_metrics[m].name);
+            for (int i = 0; i < rdma_count; i++)
+                PM("%s{device=\"%s\",port=\"%d\"} %llu\n", rdma_metrics[m].name,
+                   rdma_ports[i].device, rdma_ports[i].port,
+                   *(unsigned long long *)((char *)&rdma_ports[i] + rdma_metrics[m].off));
+        }
     }
 
 pm_done:
@@ -1561,7 +1534,7 @@ static void prom_handle(int fd) {
     req[n] = '\0';
 
     /* Bearer token auth if configured (expected header built once in main) */
-    if (prom_token) {
+    if (prom_expected_hdr[0]) {
         if (!strstr(req, prom_expected_hdr)) {
             static const char resp_401[] =
                 "HTTP/1.1 401 Unauthorized\r\n"
@@ -1575,7 +1548,7 @@ static void prom_handle(int fd) {
 
     if (strstr(req, "GET /metrics")) {
         if (!prom_body) return;
-        int bodylen = format_metrics(prom_body, prom_buf_size);
+        int bodylen = format_metrics(prom_body, PROM_BUF_SIZE);
 
         char hdr[128];
         int hlen = snprintf(hdr, sizeof(hdr),
@@ -1603,8 +1576,7 @@ static void prom_handle(int fd) {
 static void *prom_server(void *arg) {
     (void)arg;
     /* Pre-allocate buffers once for the lifetime of the thread */
-    prom_buf_size = PROM_BUF_SIZE;
-    prom_body = malloc(prom_buf_size);
+    prom_body = malloc(PROM_BUF_SIZE);
     prom_gpus = calloc(gpu_count > 0 ? gpu_count : 1, sizeof(PromGpu));
 
     while (!g_quit) {
@@ -1704,11 +1676,12 @@ int main(int argc, char *argv[]) {
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
 
+    const char *token = NULL;
     int opt;
     while ((opt = getopt(argc, argv, "p:t:vh")) != -1) {
         switch (opt) {
         case 'p': prom_port = atoi(optarg); break;
-        case 't': prom_token = optarg; break;
+        case 't': token = optarg; break;
         case 'v': printf("nv-exporter %s\n", VERSION); return 0;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
@@ -1716,11 +1689,11 @@ int main(int argc, char *argv[]) {
     }
 
     /* Token: CLI flag takes precedence, then env var */
-    if (!prom_token)
-        prom_token = getenv("NV_EXPORTER_TOKEN");
-    if (prom_token)
+    if (!token)
+        token = getenv("NV_EXPORTER_TOKEN");
+    if (token)
         snprintf(prom_expected_hdr, sizeof(prom_expected_hdr),
-                 "Authorization: Bearer %s", prom_token);
+                 "Authorization: Bearer %s", token);
 
     if (!prom_port) {
         fprintf(stderr, "Error: -p <port> is required\n");
@@ -1734,9 +1707,27 @@ int main(int argc, char *argv[]) {
     if (nvml_ok && pNvmlSystemGetDriverVersion)
         pNvmlSystemGetDriverVersion(driver_ver, sizeof(driver_ver));
 
+    /* Per-GPU handles + static labels, fetched once (see GpuStatic) */
+    if (nvml_ok && gpu_count > 0 && pNvmlDeviceGetHandleByIndex) {
+        gpu_static = calloc(gpu_count, sizeof(GpuStatic));
+        if (gpu_static) {
+            for (unsigned int d = 0; d < gpu_count; d++) {
+                if (pNvmlDeviceGetHandleByIndex(d, &gpu_static[d].dev) != NVML_SUCCESS)
+                    continue;
+                if (pNvmlDeviceGetName)
+                    pNvmlDeviceGetName(gpu_static[d].dev, gpu_static[d].name, sizeof(gpu_static[d].name));
+                if (pNvmlDeviceGetUUID)
+                    pNvmlDeviceGetUUID(gpu_static[d].dev, gpu_static[d].uuid, sizeof(gpu_static[d].uuid));
+                if (pNvmlDeviceGetVbiosVersion)
+                    pNvmlDeviceGetVbiosVersion(gpu_static[d].dev, gpu_static[d].vbios, sizeof(gpu_static[d].vbios));
+            }
+        }
+    }
+
     /* Detect Tegra GPU sysfs (Jetson fallback); when detected, the scrape
      * path prefers Tegra sysfs over NVML, which returns zeros there */
     detect_tegra_gpu();
+    detect_thermal_zones();
     detect_hwmon_sensors();
 
     /* Detect CPU count and allocate arrays */
@@ -1773,6 +1764,7 @@ int main(int argc, char *argv[]) {
     if (nvml_handle) dlclose(nvml_handle);
 
     /* Free startup allocations */
+    free(gpu_static); gpu_static = NULL;
     free(prev_ticks); prev_ticks = NULL;
     free(cur_ticks);  cur_ticks = NULL;
     free(cpu_pct);    cpu_pct = NULL;

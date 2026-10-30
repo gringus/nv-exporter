@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
+#include <stdint.h>
 #include <time.h>
 #include <signal.h>
 #include <pthread.h>
@@ -30,14 +31,16 @@ static void on_signal(int sig) { (void)sig; running = 0; }
 
 /* Parse "HH:MM" or "HH:MM:SS" into epoch seconds. Returns -1 on error. */
 static time_t parse_time(const char *s) {
-    int h, m, sec = 0;
-    if (sscanf(s, "%d:%d:%d", &h, &m, &sec) < 2) return -1;
-    time_t now = time(NULL);
     struct tm tm;
+    time_t now = time(NULL);
     localtime_r(&now, &tm);
-    tm.tm_hour = h;
-    tm.tm_min = m;
-    tm.tm_sec = sec;
+    tm.tm_sec = 0;
+    char *end = strptime(s, "%H:%M:%S", &tm);
+    if (!end) {
+        tm.tm_sec = 0;
+        end = strptime(s, "%H:%M", &tm);
+    }
+    if (!end || *end) return -1;
     time_t target = mktime(&tm);
     /* If time is in the past, assume tomorrow */
     if (target <= now) target += 86400;
@@ -61,15 +64,12 @@ static int parse_duration(const char *s) {
 
 /* ── CPU load ──────────────────────────────────────────────────────── */
 
-typedef struct {
-    int core_id;
-    int total_cores;
-} CpuThreadArg;
+static int total_cores = 1; /* set by main before threads start */
 
 static void *cpu_load_thread(void *arg) {
-    CpuThreadArg *a = (CpuThreadArg *)arg;
-    double phase = (2.0 * M_PI * a->core_id) / a->total_cores;
-    double speed = 0.6 + 0.4 * ((double)a->core_id / a->total_cores);
+    int core_id = (int)(intptr_t)arg;
+    double phase = (2.0 * M_PI * core_id) / total_cores;
+    double speed = 0.6 + 0.4 * ((double)core_id / total_cores);
 
     struct timespec ts_start;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
@@ -112,7 +112,6 @@ static void *cpu_load_thread(void *arg) {
         }
     }
 
-    free(a);
     return NULL;
 }
 
@@ -160,14 +159,8 @@ typedef void *CUmodule;
 typedef void *CUfunction;
 typedef void *CUstream;
 
-typedef struct {
-    int gpu_index;
-} GpuThreadArg;
-
 static void *gpu_load_thread(void *arg) {
-    GpuThreadArg *ga = (GpuThreadArg *)arg;
-    int gpu_idx = ga->gpu_index;
-    free(ga);
+    int gpu_idx = (int)(intptr_t)arg;
 
     void *cuda = dlopen("libcuda.so.1", RTLD_LAZY);
     if (!cuda) {
@@ -380,13 +373,10 @@ int main(int argc, char **argv) {
 
     if (do_cpu) {
         printf("Starting CPU load on %d cores (sinusoidal, phased)\n", ncpus);
+        total_cores = ncpus;
         cpu_threads = calloc(ncpus, sizeof(pthread_t));
-        for (int i = 0; i < ncpus; i++) {
-            CpuThreadArg *a = malloc(sizeof(CpuThreadArg));
-            a->core_id = i;
-            a->total_cores = ncpus;
-            pthread_create(&cpu_threads[i], NULL, cpu_load_thread, a);
-        }
+        for (int i = 0; i < ncpus; i++)
+            pthread_create(&cpu_threads[i], NULL, cpu_load_thread, (void *)(intptr_t)i);
     }
 
     if (do_gpu) {
@@ -409,11 +399,8 @@ int main(int argc, char **argv) {
         } else {
             printf("Starting GPU load on %d GPU%s (sinusoidal)\n",
                    n_gpus, n_gpus > 1 ? "s" : "");
-            for (int g = 0; g < n_gpus; g++) {
-                GpuThreadArg *ga = malloc(sizeof(GpuThreadArg));
-                ga->gpu_index = g;
-                pthread_create(&gpu_threads[g], NULL, gpu_load_thread, ga);
-            }
+            for (int g = 0; g < n_gpus; g++)
+                pthread_create(&gpu_threads[g], NULL, gpu_load_thread, (void *)(intptr_t)g);
         }
     }
 

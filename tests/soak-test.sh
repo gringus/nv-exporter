@@ -83,8 +83,8 @@ while true; do
 
     RSS_NOW=$(grep VmRSS /proc/$NV_PID/status 2>/dev/null | awk '{print $2}')
 
-    # Count prometheus scrapes (approximate from curl loop)
-    SCRAPE_COUNT=$(echo "$ELAPSED / $SCRAPE_INTERVAL" | bc 2>/dev/null || echo "?")
+    # Count prometheus scrapes (approximate; scrape interval is 0.5s)
+    SCRAPE_COUNT=$((ELAPSED * 2))
 
     DELTA=$((RSS_NOW - RSS_START))
     MINS=$((ELAPSED / 60))

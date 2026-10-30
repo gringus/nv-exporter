@@ -1,6 +1,6 @@
 /*
- * Tests for read_thermal_zones() — the per-zone parser used by the
- * Prometheus exporter.
+ * Tests for the thermal-zone parser (detect_thermal_zones +
+ * read_thermal_temps) and the disk/mount filters used by the exporter.
  *
  * Build & run: make test
  */
@@ -78,14 +78,16 @@ static void test_zones_with_gap(void) {
     /* zone3 intentionally absent */
     make_zone(4, "mem", "50500");
 
+    memset(tz_types, 0, sizeof(tz_types));
+    tz_max = 0;
+    detect_thermal_zones();
     double temps[MAX_THERMAL_ZONES] = {0};
-    char types[MAX_THERMAL_ZONES][64] = {0};
-    int n = read_thermal_zones(temps, types);
+    read_thermal_temps(temps);
 
-    ASSERT_EQ_INT("gap: highest index + 1", n, 5);
-    ASSERT_STR("gap: type[0]", types[0], "cpu-therm");
-    ASSERT_EQ_INT("gap: type[3] empty (skipped)", types[3][0], 0);
-    ASSERT_STR("gap: type[4] keeps real index", types[4], "mem");
+    ASSERT_EQ_INT("gap: highest index + 1", tz_max, 5);
+    ASSERT_STR("gap: type[0]", tz_types[0], "cpu-therm");
+    ASSERT_EQ_INT("gap: type[3] empty (skipped)", tz_types[3][0], 0);
+    ASSERT_STR("gap: type[4] keeps real index", tz_types[4], "mem");
     ASSERT_NEAR("gap: 45123 mdeg", temps[0], 45.123);
     ASSERT_NEAR("gap: 60000 mdeg", temps[1], 60.0);
     ASSERT_NEAR("gap: 39999 mdeg", temps[2], 39.999);
@@ -95,26 +97,29 @@ static void test_zones_with_gap(void) {
 static void test_no_zones(void) {
     reset_base();
 
-    double temps[MAX_THERMAL_ZONES] = {1};
-    char types[MAX_THERMAL_ZONES][64] = {0};
-    int n = read_thermal_zones(temps, types);
+    memset(tz_types, 0, sizeof(tz_types));
+    tz_max = 0;
+    detect_thermal_zones();
 
-    ASSERT_EQ_INT("none: n == 0", n, 0);
+    ASSERT_EQ_INT("none: tz_max == 0", tz_max, 0);
 }
 
 static void test_incomplete_zones(void) {
     reset_base();
-    /* type present but temp file missing -> zone skipped */
+    /* type present but temp file missing -> zone cached, temp reads 0 */
     make_zone(0, "cpu-therm", NULL);
-    /* temp present but no type file -> zone skipped */
+    /* temp present but no type file -> zone skipped entirely */
     make_zone(1, NULL, "42000");
 
-    double temps[MAX_THERMAL_ZONES] = {0};
-    char types[MAX_THERMAL_ZONES][64] = {0};
-    int n = read_thermal_zones(temps, types);
+    memset(tz_types, 0, sizeof(tz_types));
+    tz_max = 0;
+    detect_thermal_zones();
+    double temps[MAX_THERMAL_ZONES] = {1};
+    read_thermal_temps(temps);
 
-    ASSERT_EQ_INT("incomplete: n == 0", n, 0);
-    ASSERT_EQ_INT("incomplete: type[1] empty", types[1][0], 0);
+    ASSERT_EQ_INT("incomplete: typeless zone not scanned", tz_max, 1);
+    ASSERT_EQ_INT("incomplete: missing temp not written", temps[0], 1);
+    ASSERT_EQ_INT("incomplete: type[1] empty", tz_types[1][0], 0);
 }
 
 /* ── read_diskstats: whole-disk filter + field extraction ───────────── */

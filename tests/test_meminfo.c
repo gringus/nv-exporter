@@ -1,34 +1,15 @@
 /*
  * Tests for meminfo_calc() — the derived memory calculation logic.
  *
+ * Includes the real nv-exporter.c (like test_thermal.c) so the test
+ * exercises the shipped code, not a copy.
+ *
  * Build & run: make test
  */
 
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-
-/* Pull in just the struct and calc function */
-typedef struct {
-    unsigned long long total_kb;
-    unsigned long long free_kb;
-    unsigned long long avail_kb;
-    unsigned long long buffers_kb;
-    unsigned long long cached_kb;
-    unsigned long long swap_total_kb;
-    unsigned long long swap_free_kb;
-    unsigned long long app_kb;
-    unsigned long long bufcache_kb;
-    unsigned long long swap_used_kb;
-} MemInfo;
-
-static void meminfo_calc(MemInfo *m) {
-    m->bufcache_kb = m->buffers_kb + m->cached_kb;
-    m->app_kb = (m->total_kb > m->free_kb + m->bufcache_kb)
-              ? m->total_kb - m->free_kb - m->bufcache_kb : 0;
-    m->swap_used_kb = (m->swap_total_kb > m->swap_free_kb)
-                    ? m->swap_total_kb - m->swap_free_kb : 0;
-}
+#define main nv_monitor_main
+#include "../nv-exporter.c"
+#undef main
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -131,11 +112,10 @@ static void test_zero_total(void) {
 }
 
 static void test_hugepages_scenario(void) {
-    /* Simulates post-HugePages adjustment: avail overwritten, swap zeroed */
+    /* Simulates post-HugePages state: swap effectively zeroed */
     MemInfo m = {0};
     m.total_kb      = 127601388;
     m.free_kb       = 1000000;
-    m.avail_kb      = 50000000;  /* overwritten by hugepages logic */
     m.buffers_kb    = 500000;
     m.cached_kb     = 1000000;
     m.swap_total_kb = 16777216;

@@ -18,10 +18,10 @@ portable:
 	$(CC) $(CFLAGS_PORTABLE) -o $(TARGET) nv-exporter.c $(LDFLAGS)
 
 test: tests/test_meminfo.c tests/test_thermal.c
-	$(CC) -O0 -Wall -Wextra -o tests/test_meminfo tests/test_meminfo.c
-	./tests/test_meminfo
 	# -Wno-format-truncation: pre-existing snprintfs in nv-exporter.c trip the
 	# -O0-only analyzer; the release build (-O3 -flto) is warning-clean
+	$(CC) -O0 -Wall -Wextra -Wno-format-truncation -o tests/test_meminfo tests/test_meminfo.c $(LDFLAGS)
+	./tests/test_meminfo
 	$(CC) -O0 -Wall -Wextra -Wno-format-truncation -o tests/test_thermal tests/test_thermal.c $(LDFLAGS)
 	./tests/test_thermal
 
