@@ -27,12 +27,13 @@ echo " Scrape interval: ${SCRAPE_INTERVAL}s"
 echo "========================================"
 echo ""
 
-# Clean up on exit
+# Clean up on exit (|| true: set -e + non-zero wait in an EXIT trap would
+# replace the script's verdict — e.g. PASS + exit 0 — with the child's 143)
 cleanup() {
     echo ""
     echo "Stopping..."
-    kill $NV_PID $SCRAPER_PID 2>/dev/null
-    wait $NV_PID $SCRAPER_PID 2>/dev/null
+    kill $NV_PID $SCRAPER_PID 2>/dev/null || true
+    wait $NV_PID $SCRAPER_PID 2>/dev/null || true
 }
 trap cleanup EXIT
 

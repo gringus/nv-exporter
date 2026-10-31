@@ -50,7 +50,7 @@ measure() {
     local CPU2=$(cat /proc/$PID/stat 2>/dev/null | awk '{print $14+$15}')
     local CPU_PCT=$(echo "scale=2; ($CPU2-$CPU1)*100/$CLK/$DURATION" | bc 2>/dev/null)
 
-    kill $PID 2>/dev/null; wait $PID 2>/dev/null
+    kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true
 
     printf "%-35s RSS: %6s KB  Private: %6s KB  Shared: %6s KB  Threads: %s  CPU: %s%%\n" \
         "$NAME" "${RSS:-?}" "${PRIVATE:-?}" "${SHARED:-?}" "${THREADS:-?}" "${CPU_PCT:-?}"
@@ -92,7 +92,7 @@ if [ -x "$NV_EXPORTER" ]; then
     if ! grep -q nvidia /proc/$NV_PID/maps 2>/dev/null; then
         echo "  (no NVML loaded)"
     fi
-    kill $NV_PID 2>/dev/null; wait $NV_PID 2>/dev/null
+    kill $NV_PID 2>/dev/null || true; wait $NV_PID 2>/dev/null || true
 fi
 
 echo ""
