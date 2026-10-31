@@ -9,8 +9,9 @@ Accurately monitor a single machine or an entire cluster with minimal overhead. 
 ## Design
 
 - Scrape-driven: every scrape samples the sensors fresh — CPU% is the delta since the previous scrape, network/RDMA are raw `*_total` counters (use `rate()` in PromQL). No internal timer.
+- Thermal zones are discovered once at startup (re-probed per scrape until the first appear, e.g. on late-populating `/sys`). Zones added afterwards require a restart.
 - NVML loaded dynamically at runtime — no hard dependency on NVIDIA drivers
-- Correctly handles **HugePages** on DGX Spark where `MemAvailable` is inaccurate
+- Correctly handles **HugePages** on DGX Spark: `MemAvailable` is inaccurate there, so app memory is computed from free + buffers + cached, and swap is reported as 0 (hugetlbfs pages are not swappable)
 - Reports metrics to NVIDIA specifications via NVML, with correct handling of unified memory and ARM big.LITTLE core topology (per-core `type` labels: **X925** performance / **X725** efficiency on Grace)
 
 ## Download

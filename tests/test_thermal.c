@@ -82,12 +82,14 @@ static void test_zones_with_gap(void) {
     tz_max = 0;
     detect_thermal_zones();
     double temps[MAX_THERMAL_ZONES] = {0};
-    read_thermal_temps(temps);
+    int ok[MAX_THERMAL_ZONES] = {0};
+    read_thermal_temps(temps, ok);
 
     ASSERT_EQ_INT("gap: highest index + 1", tz_max, 5);
     ASSERT_STR("gap: type[0]", tz_types[0], "cpu-therm");
     ASSERT_EQ_INT("gap: type[3] empty (skipped)", tz_types[3][0], 0);
     ASSERT_STR("gap: type[4] keeps real index", tz_types[4], "mem");
+    ASSERT_EQ_INT("gap: ok[0]", ok[0], 1);
     ASSERT_NEAR("gap: 45123 mdeg", temps[0], 45.123);
     ASSERT_NEAR("gap: 60000 mdeg", temps[1], 60.0);
     ASSERT_NEAR("gap: 39999 mdeg", temps[2], 39.999);
@@ -115,10 +117,12 @@ static void test_incomplete_zones(void) {
     tz_max = 0;
     detect_thermal_zones();
     double temps[MAX_THERMAL_ZONES] = {1};
-    read_thermal_temps(temps);
+    int ok[MAX_THERMAL_ZONES] = {0};
+    read_thermal_temps(temps, ok);
 
     ASSERT_EQ_INT("incomplete: typeless zone not scanned", tz_max, 1);
     ASSERT_EQ_INT("incomplete: missing temp not written", temps[0], 1);
+    ASSERT_EQ_INT("incomplete: missing temp not ok", ok[0], 0);
     ASSERT_EQ_INT("incomplete: type[1] empty", tz_types[1][0], 0);
 }
 

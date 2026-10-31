@@ -58,4 +58,4 @@ The Prometheus exposition format **requires** decimal points (`1.23`), never com
 - Target arch is **aarch64**. NVML library paths include both aarch64 and x86_64 fallbacks.
 - No fan speed sensor on GB10 (handled gracefully via return code check).
 - **Grace CPU is big.LITTLE**: 10x Cortex-X925 (performance, 3.9 GHz) + 10x Cortex-X725 (efficiency, 2.8 GHz). Core types are identified via ARM CPU part IDs in `/proc/cpuinfo` (`0xd85` = X925, `0xd87` = X725) and exposed as the per-core `type` label in Prometheus.
-- When HugePages are active, `MemAvailable` is inaccurate — the code uses `HugePages_Free * Hugepagesize` instead (per NVIDIA known-issues docs).
+- When HugePages are active, `MemAvailable` is inaccurate — the code never uses it (`app_kb` comes from free + buffers + cached) and reports swap as 0, since hugetlbfs pages are not swappable (per NVIDIA known-issues docs).

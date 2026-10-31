@@ -106,10 +106,12 @@ static const unsigned int link_field_ids[] = {
  * sync with the array layout (reorder here, not bare literals at call sites) */
 #define LINK_FIELDS ((int)(sizeof link_field_ids / sizeof *link_field_ids))
 enum { LINK_ECC_OFF = 0, LINK_ROLLOVER_OFF = 4, LINK_RECOVERY_OFF = 5, LINK_ERR_OFF = 6 };
-static const char *const pcie_err_types[10] = {
+#define LINK_ECC_FIELDS (LINK_ROLLOVER_OFF - LINK_ECC_OFF)
+static const char *const pcie_err_types[] = {
     "correctable", "naks_received", "receiver_error", "bad_tlp", "naks_sent",
     "bad_dllp", "non_fatal_error", "fatal_error", "unsupported_request", "lcrc_error"
 };
+#define PCIE_ERR_FIELDS ((int)(sizeof pcie_err_types / sizeof *pcie_err_types))
 /* severity/mode labels for the four ECC totals: 3=sbe/vol 4=dbe/vol 5=sbe/agg 6=dbe/agg */
 static const char *const ecc_severity[2] = { "single_bit", "double_bit" };
 static const char *const ecc_mode[2]     = { "volatile", "aggregate" };
@@ -900,14 +902,14 @@ typedef struct {
     unsigned long long viol_ns[VIOL_FIELDS]; /* per viol_field_ids (perf policies + HW slowdown reasons) */
     int      has_viol[VIOL_FIELDS];
     /* PCIe link health + ECC totals (per link_field_ids) */
-    unsigned long long ecc_err[4];
-    int      has_ecc[4];
+    unsigned long long ecc_err[LINK_ECC_FIELDS];
+    int      has_ecc[LINK_ECC_FIELDS];
     unsigned long long pcie_rollover;
     int      has_pcie_rollover;
     unsigned long long pcie_recovery;
     int      has_pcie_recovery;
-    unsigned long long pcie_err[10];
-    int      has_pcie_err[10];
+    unsigned long long pcie_err[PCIE_ERR_FIELDS];
+    int      has_pcie_err[PCIE_ERR_FIELDS];
     unsigned int clk_max_gfx, clk_max_sm, clk_max_video;
     unsigned int clk_sm, clk_video;
     /* NVLink-C2C link (Grace<->GPU): present only on GB10-class platforms */
@@ -977,6 +979,7 @@ static char tz_types[MAX_THERMAL_ZONES][64];
 static int  tz_max = 0;
 
 static void detect_thermal_zones(void) {
+    if (tz_max > 0) return; /* one-shot once zones are found */
     for (int i = 0; i < MAX_THERMAL_ZONES; i++) {
         char path[128];
         snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/type", i);
@@ -995,16 +998,19 @@ static void detect_thermal_zones(void) {
                 }
 }
 
-/* Per-scrape temp read for zones found at startup. Unreadable temps leave
- * the entry at 0 — emitted like a real 0 reading. */
-static void read_thermal_temps(double temps[]) {
+/* Per-scrape temp read for zones found at startup. Zones whose temp file is
+ * unreadable are omitted (ok[i] stays 0) — a 0.0 reading would mask the
+ * failure in dashboards and low-temp alerts. */
+static void read_thermal_temps(double temps[], int ok[]) {
     for (int i = 0; i < tz_max; i++) {
         char path[128];
         int millideg;
         if (!tz_types[i][0]) continue;
         snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/temp", i);
-        if (read_sysfs_int(path, &millideg))
+        if (read_sysfs_int(path, &millideg)) {
             temps[i] = millideg / 1000.0;
+            ok[i] = 1;
+        }
     }
 }
 
@@ -1072,14 +1078,19 @@ static int format_metrics(char *buf, int buflen) {
             PM("nv_cpu_seconds_total{mode=\"%s\"} %.1f\n", modes[m], agg[m] / hz);
     }
 
-    /* Per-thermal-zone temperatures (zone index + kernel zone type) */
+    /* Per-thermal-zone temperatures (zone index + kernel zone type).
+     * Zone discovery is one-shot: if none existed at startup, re-probe per
+     * scrape until they appear (late /sys populate); zones are never added
+     * after the first are found. */
+    if (tz_max == 0) detect_thermal_zones();
     double tz_temp[MAX_THERMAL_ZONES] = {0};
-    read_thermal_temps(tz_temp);
+    int    tz_ok[MAX_THERMAL_ZONES] = {0};
+    read_thermal_temps(tz_temp, tz_ok);
     if (tz_max > 0) {
         PM("# HELP nv_thermal_zone_temperature_celsius Thermal zone temperature\n"
            "# TYPE nv_thermal_zone_temperature_celsius gauge\n");
         for (int i = 0; i < tz_max; i++)
-            if (tz_types[i][0])
+            if (tz_types[i][0] && tz_ok[i])
                 PM("nv_thermal_zone_temperature_celsius{zone=\"%d\",type=\"%s\"} %.1f\n",
                    i, tz_types[i], tz_temp[i]);
     }
@@ -1223,7 +1234,7 @@ static int format_metrics(char *buf, int buflen) {
                 /* Tegra sysfs overrides NVML, which returns zeros there */
                 int tutil = read_tegra_gpu_util();
                 if (tutil >= 0) g->util_gpu = (unsigned int)tutil;
-                if (tegra_gpu_zone_idx >= 0)
+                if (tegra_gpu_zone_idx >= 0 && tz_ok[tegra_gpu_zone_idx])
                     g->temp = (unsigned int)tz_temp[tegra_gpu_zone_idx];
             } else {
                 if (pNvmlDeviceGetUtilizationRates) {
@@ -1326,7 +1337,7 @@ static int format_metrics(char *buf, int buflen) {
                 nvmlFieldValue_t fv[LINK_FIELDS];
                 for (int v = 0; v < LINK_FIELDS; v++) { fv[v] = (nvmlFieldValue_t){0}; fv[v].fieldId = link_field_ids[v]; }
                 if (pNvmlDeviceGetFieldValues(dev, LINK_FIELDS, fv) == NVML_SUCCESS) {
-                    for (int v = 0; v < LINK_ERR_OFF; v++) /* leading ECC totals */
+                    for (int v = 0; v < LINK_ROLLOVER_OFF; v++) /* leading ECC totals */
                         if (fv[v].nvmlReturn == NVML_SUCCESS) {
                             g->has_ecc[v] = 1; g->ecc_err[v] = fv[v].value.ullVal;
                         }
@@ -1563,7 +1574,7 @@ static int format_metrics(char *buf, int buflen) {
         PM("# HELP nv_gpu_pcie_errors_total PCIe error counters (since driver load)\n"
            "# TYPE nv_gpu_pcie_errors_total counter\n");
         for (int d = 0; d < n_gpus; d++)
-            for (int t = 0; t < 10; t++)
+            for (int t = 0; t < PCIE_ERR_FIELDS; t++)
                 if (gpus[d].has_pcie_err[t])
                     PM("nv_gpu_pcie_errors_total{gpu=\"%d\",type=\"%s\"} %llu\n",
                        d, pcie_err_types[t], gpus[d].pcie_err[t]);
@@ -1571,7 +1582,7 @@ static int format_metrics(char *buf, int buflen) {
         PM("# HELP nv_gpu_ecc_errors_total GPU ECC errors (since driver load)\n"
            "# TYPE nv_gpu_ecc_errors_total counter\n");
         for (int d = 0; d < n_gpus; d++)
-            for (int v = 0; v < 4; v++)
+            for (int v = 0; v < LINK_ECC_FIELDS; v++)
                 if (gpus[d].has_ecc[v])
                     PM("nv_gpu_ecc_errors_total{gpu=\"%d\",severity=\"%s\",mode=\"%s\"} %llu\n",
                        d, ecc_severity[v & 1], ecc_mode[v >> 1], gpus[d].ecc_err[v]);

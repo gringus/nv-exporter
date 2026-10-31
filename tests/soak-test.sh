@@ -16,6 +16,7 @@ DURATION_SEC=$((DURATION_MIN * 60))
 NV_EXPORTER="./nv-exporter"
 PROM_PORT=9177
 SCRAPE_INTERVAL=0.5  # seconds between prometheus scrapes
+SCRAPE_HZ=2          # scrapes per second — keep in sync with SCRAPE_INTERVAL
 RSS_SAMPLE_INTERVAL=5  # seconds between RSS samples
 
 echo "========================================"
@@ -84,8 +85,8 @@ while true; do
 
     RSS_NOW=$(grep VmRSS /proc/$NV_PID/status 2>/dev/null | awk '{print $2}')
 
-    # Count prometheus scrapes (approximate; scrape interval is 0.5s)
-    SCRAPE_COUNT=$((ELAPSED * 2))
+    # Count prometheus scrapes (approximate; derived from SCRAPE_HZ)
+    SCRAPE_COUNT=$((ELAPSED * SCRAPE_HZ))
 
     DELTA=$((RSS_NOW - RSS_START))
     MINS=$((ELAPSED / 60))
@@ -108,7 +109,7 @@ DELTA=$((RSS_END - RSS_START))
 echo "RSS start:      ${RSS_START} KB"
 echo "RSS end:        ${RSS_END} KB"
 echo "RSS delta:      ${DELTA} KB"
-echo "Prom scrapes:   ~$((DURATION_SEC * 2))"
+echo "Prom scrapes:   ~$((DURATION_SEC * SCRAPE_HZ))"
 echo ""
 
 if [ $DELTA -gt 1024 ]; then
