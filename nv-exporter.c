@@ -79,14 +79,40 @@ typedef struct {
  * 74/76/77/78/79 are the long-standing NVML_FI_DEV_PERF_POLICY_* counters (docs
  * now alias POWER/SYNC_BOOST to CLOCKS_EVENT_REASON_SW_POWER_CAP/_SYNC_BOOST);
  * 269 = NVML_FI_DEV_CLOCKS_EVENT_REASON_SW_THERM_SLOWDOWN, the replacement for
- * the retired THERMAL policy. All counters in ns. */
-static const unsigned int viol_field_ids[6] = { 74, 269, 76, 77, 78, 79 };
+ * the retired THERMAL policy; 270/271 = the HW thermal/power-brake slowdown
+ * reasons (no legacy perf-policy equivalent); 80/81 = PERF_POLICY_TOTAL_APP/
+ * BASE_CLOCKS (time held below application/base clocks). All counters in ns. */
+static const unsigned int viol_field_ids[] = { 74, 269, 76, 77, 78, 79, 270, 271, 80, 81 };
+/* Batch size, derived so adding a reason is a one-line change */
+#define VIOL_FIELDS ((int)(sizeof viol_field_ids / sizeof *viol_field_ids))
 
 /* Second field-values batch (NVML field IDs): 186 = NVML_FI_DEV_POWER_INSTANT
  * (mW, differs from the averaged nvmlDeviceGetPowerUsage); 170/171/172 =
  * NVML_FI_DEV_C2C_LINK_{COUNT,GET_STATUS,GET_MAX_BW} — the Grace/GB10
  * NVLink-C2C link, present on DGX Spark, absent on other platforms. */
 static const unsigned int extra_field_ids[4] = { 186, 170, 171, 172 };
+
+/* Third field-values batch: PCIe link health + ECC totals, in link_field_ids
+ * order. 95 = NVML_FI_DEV_PCIE_REPLAY_ROLLOVER_COUNTER, 169 = L0->recovery
+ * counter; 173..182 = NVML_FI_DEV_PCIE_COUNT_* (labeled via pcie_err_types);
+ * 3..6 = NVML_FI_DEV_ECC_{SBE,DBE}_{VOL,AGG}_TOTAL (labeled severity x mode).
+ * All cumulative since driver load; most drivers pre-GB10 lack the COUNT_* set.
+ * (TEMPERATURE_GPU_MAX_TLIMIT 196 was probed: accepted by the driver but
+ * returns 0 on GB10 — not worth a permanently-zero series.) */
+static const unsigned int link_field_ids[] = {
+    3, 4, 5, 6, 95, 169, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182
+};
+/* Batch size + group offsets into the positional results — keep the enum in
+ * sync with the array layout (reorder here, not bare literals at call sites) */
+#define LINK_FIELDS ((int)(sizeof link_field_ids / sizeof *link_field_ids))
+enum { LINK_ECC_OFF = 0, LINK_ROLLOVER_OFF = 4, LINK_RECOVERY_OFF = 5, LINK_ERR_OFF = 6 };
+static const char *const pcie_err_types[10] = {
+    "correctable", "naks_received", "receiver_error", "bad_tlp", "naks_sent",
+    "bad_dllp", "non_fatal_error", "fatal_error", "unsupported_request", "lcrc_error"
+};
+/* severity/mode labels for the four ECC totals: 3=sbe/vol 4=dbe/vol 5=sbe/agg 6=dbe/agg */
+static const char *const ecc_severity[2] = { "single_bit", "double_bit" };
+static const char *const ecc_mode[2]     = { "volatile", "aggregate" };
 
 /* C2C per-link error counters (NVML field IDs): query with scopeId = link index
  * 0..count-1 (scopeId >= count returns non-success). Cumulative since driver
@@ -871,8 +897,17 @@ typedef struct {
     int      has_energy;
     unsigned int replay;
     int      has_replay;
-    unsigned long long viol_ns[6]; /* per nvmlPerfPolicyType 0..5 */
-    int      has_viol[6];
+    unsigned long long viol_ns[VIOL_FIELDS]; /* per viol_field_ids (perf policies + HW slowdown reasons) */
+    int      has_viol[VIOL_FIELDS];
+    /* PCIe link health + ECC totals (per link_field_ids) */
+    unsigned long long ecc_err[4];
+    int      has_ecc[4];
+    unsigned long long pcie_rollover;
+    int      has_pcie_rollover;
+    unsigned long long pcie_recovery;
+    int      has_pcie_recovery;
+    unsigned long long pcie_err[10];
+    int      has_pcie_err[10];
     unsigned int clk_max_gfx, clk_max_sm, clk_max_video;
     unsigned int clk_sm, clk_video;
     /* NVLink-C2C link (Grace<->GPU): present only on GB10-class platforms */
@@ -909,10 +944,13 @@ static void gpu_proc_name(unsigned int pid, char *out, size_t cap)
     out[j] = 0;
 }
 
-/* Label names for nvmlPerfPolicyType 0..5 (policy indices are the array order) */
-static const char *const viol_reasons[6] = {
+/* Label names for nv_gpu_throttle_duration_seconds_total (indices are the
+ * viol_field_ids order) */
+static const char *const viol_reasons[VIOL_FIELDS] = {
     "sw_power_cap", "sw_thermal_slowdown", "sync_boost",
-    "board_limit", "low_utilization", "reliability"
+    "board_limit", "low_utilization", "reliability",
+    "hw_thermal_slowdown", "hw_power_brake",
+    "total_app_clocks", "total_base_clocks"
 };
 
 static char driver_ver[80] = ""; /* set once at startup when NVML is present */
@@ -1212,16 +1250,17 @@ static int format_metrics(char *buf, int buflen) {
                 g->has_replay = (pNvmlDeviceGetPcieReplayCounter &&
                                  pNvmlDeviceGetPcieReplayCounter(dev, &g->replay) == NVML_SUCCESS);
                 if (pNvmlDeviceGetFieldValues) {
-                    /* One batched query for all six duration counters */
-                    nvmlFieldValue_t fv[6];
-                    for (int v = 0; v < 6; v++) { fv[v] = (nvmlFieldValue_t){0}; fv[v].fieldId = viol_field_ids[v]; }
-                    if (pNvmlDeviceGetFieldValues(dev, 6, fv) == NVML_SUCCESS)
-                        for (int v = 0; v < 6; v++)
+                    /* One batched query for all duration counters */
+                    nvmlFieldValue_t fv[VIOL_FIELDS];
+                    for (int v = 0; v < VIOL_FIELDS; v++) { fv[v] = (nvmlFieldValue_t){0}; fv[v].fieldId = viol_field_ids[v]; }
+                    if (pNvmlDeviceGetFieldValues(dev, VIOL_FIELDS, fv) == NVML_SUCCESS)
+                        for (int v = 0; v < VIOL_FIELDS; v++)
                             if (fv[v].nvmlReturn == NVML_SUCCESS) {
                                 g->has_viol[v] = 1; g->viol_ns[v] = fv[v].value.ullVal;
                             }
                 } else if (pNvmlDeviceGetViolationStatus) {
-                    /* pre-field-values drivers only */
+                    /* pre-field-values drivers only; the legacy perf-policy API
+                     * covers the first six entries only */
                     for (int v = 0; v < 6; v++) {
                         nvmlViolationTime_t vt = {0};
                         g->has_viol[v] = (pNvmlDeviceGetViolationStatus(dev, v, &vt) == NVML_SUCCESS);
@@ -1277,6 +1316,30 @@ static int format_metrics(char *buf, int buflen) {
                             g->c2c_err_n = (int)l + 1;
                         }
                     }
+                }
+            }
+
+            /* PCIe link health + ECC totals, one batched query (see
+             * link_field_ids); per-field has_ flags, unsupported fields
+             * (e.g. PCIe COUNT_* on Tegra) stay absent */
+            if (pNvmlDeviceGetFieldValues) {
+                nvmlFieldValue_t fv[LINK_FIELDS];
+                for (int v = 0; v < LINK_FIELDS; v++) { fv[v] = (nvmlFieldValue_t){0}; fv[v].fieldId = link_field_ids[v]; }
+                if (pNvmlDeviceGetFieldValues(dev, LINK_FIELDS, fv) == NVML_SUCCESS) {
+                    for (int v = 0; v < LINK_ERR_OFF; v++) /* leading ECC totals */
+                        if (fv[v].nvmlReturn == NVML_SUCCESS) {
+                            g->has_ecc[v] = 1; g->ecc_err[v] = fv[v].value.ullVal;
+                        }
+                    if (fv[LINK_ROLLOVER_OFF].nvmlReturn == NVML_SUCCESS) {
+                        g->has_pcie_rollover = 1; g->pcie_rollover = fv[LINK_ROLLOVER_OFF].value.ullVal;
+                    }
+                    if (fv[LINK_RECOVERY_OFF].nvmlReturn == NVML_SUCCESS) {
+                        g->has_pcie_recovery = 1; g->pcie_recovery = fv[LINK_RECOVERY_OFF].value.ullVal;
+                    }
+                    for (int v = 0; v < LINK_FIELDS - LINK_ERR_OFF; v++)
+                        if (fv[LINK_ERR_OFF + v].nvmlReturn == NVML_SUCCESS) {
+                            g->has_pcie_err[v] = 1; g->pcie_err[v] = fv[LINK_ERR_OFF + v].value.ullVal;
+                        }
                 }
             }
 
@@ -1468,7 +1531,7 @@ static int format_metrics(char *buf, int buflen) {
         PM("# HELP nv_gpu_throttle_duration_seconds_total Cumulative time GPU clocks were limited, per cause\n"
            "# TYPE nv_gpu_throttle_duration_seconds_total counter\n");
         for (int d = 0; d < n_gpus; d++)
-            for (int v = 0; v < 6; v++)
+            for (int v = 0; v < VIOL_FIELDS; v++)
                 if (gpus[d].has_viol[v])
                     PM("nv_gpu_throttle_duration_seconds_total{gpu=\"%d\",reason=\"%s\"} %.6f\n",
                        d, viol_reasons[v], gpus[d].viol_ns[v] / 1e9);
@@ -1484,6 +1547,34 @@ static int format_metrics(char *buf, int buflen) {
         for (int d = 0; d < n_gpus; d++)
             if (gpus[d].has_replay)
                 PM("nv_gpu_pcie_replay_total{gpu=\"%d\"} %u\n", d, gpus[d].replay);
+
+        PM("# HELP nv_gpu_pcie_replay_rollover_total PCIe replay counter rollovers (link health)\n"
+           "# TYPE nv_gpu_pcie_replay_rollover_total counter\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_pcie_rollover)
+                PM("nv_gpu_pcie_replay_rollover_total{gpu=\"%d\"} %llu\n", d, gpus[d].pcie_rollover);
+
+        PM("# HELP nv_gpu_pcie_recovery_total PCIe link L0-to-recovery transitions (link health)\n"
+           "# TYPE nv_gpu_pcie_recovery_total counter\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].has_pcie_recovery)
+                PM("nv_gpu_pcie_recovery_total{gpu=\"%d\"} %llu\n", d, gpus[d].pcie_recovery);
+
+        PM("# HELP nv_gpu_pcie_errors_total PCIe error counters (since driver load)\n"
+           "# TYPE nv_gpu_pcie_errors_total counter\n");
+        for (int d = 0; d < n_gpus; d++)
+            for (int t = 0; t < 10; t++)
+                if (gpus[d].has_pcie_err[t])
+                    PM("nv_gpu_pcie_errors_total{gpu=\"%d\",type=\"%s\"} %llu\n",
+                       d, pcie_err_types[t], gpus[d].pcie_err[t]);
+
+        PM("# HELP nv_gpu_ecc_errors_total GPU ECC errors (since driver load)\n"
+           "# TYPE nv_gpu_ecc_errors_total counter\n");
+        for (int d = 0; d < n_gpus; d++)
+            for (int v = 0; v < 4; v++)
+                if (gpus[d].has_ecc[v])
+                    PM("nv_gpu_ecc_errors_total{gpu=\"%d\",severity=\"%s\",mode=\"%s\"} %llu\n",
+                       d, ecc_severity[v & 1], ecc_mode[v >> 1], gpus[d].ecc_err[v]);
     }
 
     /* RDMA / InfiniBand */

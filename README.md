@@ -103,15 +103,19 @@ curl -s localhost:9101/metrics     # Check it works
 | `nv_gpu_decoder_utilization_percent` | gauge | `gpu` | Hardware decoder utilization |
 | `nv_gpu_performance_state` | gauge | `gpu` | P-state (0 = P0 / max clocks) |
 | `nv_gpu_clocks_event_reasons` | gauge | `gpu` | Live throttle-reason bitmask (NVML/DCGM format) |
-| `nv_gpu_throttle_duration_seconds_total` | counter | `gpu`, `reason` | Cumulative time clocks were held down per cause (`sw_power_cap`, `sw_thermal_slowdown`, `sync_boost`, `board_limit`, `low_utilization`, `reliability`) — `rate()` = throttle duty cycle |
+| `nv_gpu_throttle_duration_seconds_total` | counter | `gpu`, `reason` | Cumulative time clocks were held down per cause (`sw_power_cap`, `sw_thermal_slowdown`, `sync_boost`, `board_limit`, `low_utilization`, `reliability`, `hw_thermal_slowdown`, `hw_power_brake`, `total_app_clocks`, `total_base_clocks`) — `rate()` = throttle duty cycle |
 | `nv_gpu_energy_millijoules_total` | counter | `gpu` | Cumulative GPU energy (`rate()/1000` = average watts) |
 | `nv_gpu_pcie_replay_total` | counter | `gpu` | PCIe TLP replays (link-health counter) |
+| `nv_gpu_pcie_replay_rollover_total` | counter | `gpu` | PCIe replay counter rollovers |
+| `nv_gpu_pcie_recovery_total` | counter | `gpu` | PCIe L0-to-recovery transitions |
+| `nv_gpu_pcie_errors_total` | counter | `gpu`, `type` | PCIe error counters (`correctable`, `naks_received`, `receiver_error`, `bad_tlp`, `naks_sent`, `bad_dllp`, `non_fatal_error`, `fatal_error`, `unsupported_request`, `lcrc_error`) |
+| `nv_gpu_ecc_errors_total` | counter | `gpu`, `severity`, `mode` | GPU ECC errors (`single_bit`/`double_bit` × `volatile`/`aggregate`) |
 | `nv_rdma_info` | gauge | `device`, `port`, `state`, `rate` | RDMA port state and link rate |
 | `nv_rdma_xmit_bytes_total`, `nv_rdma_recv_bytes_total` | counter | `device`, `port` | RDMA port traffic |
 | `nv_rdma_xmit_packets_total`, `nv_rdma_recv_packets_total` | counter | `device`, `port` | RDMA port packet counts |
 | `nv_rdma_errors_total` | counter | `device`, `port` | Sum of RDMA error counters |
 
-GPU metrics gated on NVML support (`uuid`, `performance_state`, `clocks_event_reasons`, `throttle_duration`, `energy`, `pcie_replay`, `power_instant`, `c2c_link_*`, `c2c_errors`) are omitted silently where the driver/SoC does not expose them — the C2C link metrics appear only on Grace+GPU platforms. On a DGX Spark (GB10) everything above emits except `gpu_memory_*` (unified memory) and `fan_speed` (no sensor).
+GPU metrics gated on NVML support (`uuid`, `performance_state`, `clocks_event_reasons`, `throttle_duration`, `energy`, `pcie_replay`, `pcie_replay_rollover`, `pcie_recovery`, `pcie_errors`, `ecc_errors`, `power_instant`, `c2c_link_*`, `c2c_errors`) are omitted silently where the driver/SoC does not expose them — the C2C link metrics appear only on Grace+GPU platforms, and the `pcie_errors` counter set needs a recent driver. On a DGX Spark (GB10) everything above emits except `gpu_memory_*` (unified memory) and `fan_speed` (no sensor).
 
 ### Prometheus scrape config
 
